@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import math
 import pickle
 import pathlib
@@ -46,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--early-stopping-patience", type=int, default=8)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-3)
     parser.add_argument("--compile", action="store_true",
                         help="Compile the model with torch.compile.")
     parser.add_argument("--resume", type=Path, default=None,
@@ -226,11 +229,125 @@ def load_checkpoint(path: Path, device: str) -> dict:
             return torch.load(path, map_location=device)
 
 
+class TrainLogger:
+    def __init__(self, output_dir: Path) -> None:
+        self.log_path = output_dir / "train.log"
+        self.step_csv_path = output_dir / "step_metrics.csv"
+        self.eval_csv_path = output_dir / "eval_metrics.csv"
+        self.loss_curve_path = output_dir / "loss_curve.png"
+        self._step_header_written = self.step_csv_path.exists(
+        ) and self.step_csv_path.stat().st_size > 0
+        self._eval_header_written = self.eval_csv_path.exists(
+        ) and self.eval_csv_path.stat().st_size > 0
+        self.eval_history: list[dict[str, float]] = []
+        if self._eval_header_written:
+            self._load_eval_history()
+
+    def _load_eval_history(self) -> None:
+        with self.eval_csv_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            self.eval_history = [
+                {
+                    "step": float(row["step"]),
+                    "train_loss": float(row["train_loss"]),
+                    "val_loss": float(row["val_loss"]),
+                }
+                for row in reader
+            ]
+
+    def log(self, message: str) -> None:
+        print(message)
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+
+    def log_step(
+        self,
+        *,
+        step: int,
+        loss: float,
+        lr: float,
+        toks_per_sec: float,
+        elapsed_sec: float,
+    ) -> None:
+        with self.step_csv_path.open("a", newline="", encoding="utf-8") as handle:
+            fieldnames = ["step", "loss", "lr", "toks_per_sec", "elapsed_sec"]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if not self._step_header_written:
+                writer.writeheader()
+                self._step_header_written = True
+            writer.writerow(
+                {
+                    "step": step,
+                    "loss": loss,
+                    "lr": lr,
+                    "toks_per_sec": toks_per_sec,
+                    "elapsed_sec": elapsed_sec,
+                }
+            )
+
+    def log_eval(
+        self,
+        *,
+        step: int,
+        train_loss: float,
+        val_loss: float,
+        lr: float,
+        elapsed_sec: float,
+    ) -> None:
+        with self.eval_csv_path.open("a", newline="", encoding="utf-8") as handle:
+            fieldnames = ["step", "train_loss",
+                          "val_loss", "lr", "elapsed_sec"]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if not self._eval_header_written:
+                writer.writeheader()
+                self._eval_header_written = True
+            writer.writerow(
+                {
+                    "step": step,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "lr": lr,
+                    "elapsed_sec": elapsed_sec,
+                }
+            )
+        self.eval_history.append(
+            {"step": float(step), "train_loss": train_loss,
+             "val_loss": val_loss}
+        )
+        self.save_loss_curve()
+
+    def save_loss_curve(self) -> None:
+        if not self.eval_history:
+            return
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+
+        steps = [row["step"] for row in self.eval_history]
+        train_losses = [row["train_loss"] for row in self.eval_history]
+        val_losses = [row["val_loss"] for row in self.eval_history]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(steps, train_losses, label="train_loss", linewidth=2)
+        ax.plot(steps, val_losses, label="val_loss", linewidth=2)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss")
+        ax.set_title("Training Loss Curve")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(self.loss_curve_path, dpi=160)
+        plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    logger = TrainLogger(args.output_dir)
     set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
+    train_start_time = time.time()
 
     device = args.device
     device_type = "cuda" if device.startswith("cuda") else "cpu"
@@ -262,7 +379,7 @@ def main() -> None:
         model.load_state_dict(checkpoint["model"])
         start_step = int(checkpoint["step"]) + 1
         best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
-        print(f"resumed from {args.resume} at step {start_step}")
+        logger.log(f"resumed from {args.resume} at step {start_step}")
     raw_model = model
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -281,19 +398,28 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer"])
 
     total_params = sum(p.numel() for p in raw_model.parameters())
-    print(f"dataset: {data['dataset_name']}")
-    print(f"vocab size: {config.vocab_size}")
-    print(f"parameters: {total_params / 1e6:.2f}M")
-    print(
+    logger.log(f"dataset: {data['dataset_name']}")
+    logger.log(f"vocab size: {config.vocab_size}")
+    logger.log(f"parameters: {total_params / 1e6:.2f}M")
+    logger.log(
         "default training settings: "
         f"--batch-size {args.batch_size} --grad-accum-steps {args.grad_accum_steps} --max-steps {args.max_steps}"
+    )
+    logger.log(
+        "early stopping settings: "
+        f"--early-stopping-patience {args.early_stopping_patience} "
+        f"--early-stopping-min-delta {args.early_stopping_min_delta}"
     )
 
     model.train()
     running_mfu_tokens = 0
     window_start = time.time()
+    no_improve_evals = 0
+    last_completed_step = max(start_step - 1, 0)
+    early_stop_triggered = False
 
     for step in range(start_step, args.max_steps):
+        last_completed_step = step
         lr = get_lr(
             step,
             base_lr=args.learning_rate,
@@ -340,8 +466,15 @@ def main() -> None:
         if step % 20 == 0:
             elapsed = max(time.time() - window_start, 1e-6)
             toks_per_sec = running_mfu_tokens / elapsed
-            print(
+            logger.log(
                 f"step {step:5d} | loss {loss_accum:.4f} | lr {lr:.6f} | toks/s {toks_per_sec:,.0f}"
+            )
+            logger.log_step(
+                step=step,
+                loss=loss_accum,
+                lr=lr,
+                toks_per_sec=toks_per_sec,
+                elapsed_sec=time.time() - train_start_time,
             )
             running_mfu_tokens = 0
             window_start = time.time()
@@ -359,11 +492,23 @@ def main() -> None:
                 device=device,
                 autocast_ctx=autocast_ctx,
             )
-            print(
+            logger.log(
                 f"eval step {step:5d} | train {metrics['train']:.4f} | val {metrics['val']:.4f}"
             )
-            if metrics["val"] < best_val_loss:
+            logger.log_eval(
+                step=step,
+                train_loss=metrics["train"],
+                val_loss=metrics["val"],
+                lr=lr,
+                elapsed_sec=time.time() - train_start_time,
+            )
+            improved = (
+                math.isinf(best_val_loss)
+                or metrics["val"] < best_val_loss - args.early_stopping_min_delta
+            )
+            if improved:
                 best_val_loss = metrics["val"]
+                no_improve_evals = 0
                 save_checkpoint(
                     best_path,
                     model=raw_model,
@@ -373,7 +518,13 @@ def main() -> None:
                     best_val_loss=best_val_loss,
                     args=args,
                 )
-                print(f"saved new best checkpoint to {best_path}")
+                logger.log(f"saved new best checkpoint to {best_path}")
+            else:
+                no_improve_evals += 1
+                logger.log(
+                    "no validation improvement "
+                    f"({no_improve_evals}/{args.early_stopping_patience})"
+                )
             save_checkpoint(
                 checkpoint_path,
                 model=raw_model,
@@ -383,6 +534,15 @@ def main() -> None:
                 best_val_loss=best_val_loss,
                 args=args,
             )
+            if (
+                args.early_stopping_patience > 0
+                and no_improve_evals >= args.early_stopping_patience
+            ):
+                logger.log(
+                    f"early stopping triggered at step {step} with best val loss {best_val_loss:.4f}"
+                )
+                early_stop_triggered = True
+                break
 
         if step > 0 and step % args.save_interval == 0:
             save_checkpoint(
@@ -400,11 +560,17 @@ def main() -> None:
         model=raw_model,
         optimizer=optimizer,
         config=config,
-        step=max(start_step, args.max_steps - 1),
+        step=last_completed_step,
         best_val_loss=best_val_loss,
         args=args,
     )
-    print(f"training complete, final checkpoint saved to {checkpoint_path}")
+    logger.save_loss_curve()
+    if early_stop_triggered:
+        logger.log(
+            f"training stopped early, final checkpoint saved to {checkpoint_path}")
+    else:
+        logger.log(
+            f"training complete, final checkpoint saved to {checkpoint_path}")
 
 
 if __name__ == "__main__":
