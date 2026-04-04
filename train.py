@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
+import pickle
+import pathlib
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -17,16 +19,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a small dialogue-oriented GPT on DailyDialog."
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("out/dailydialog_small"))
+    parser.add_argument("--output-dir", type=Path,
+                        default=Path("out/dailydialog_small"))
     parser.add_argument("--cache-dir", type=Path, default=Path("data_cache"))
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--n-layer", type=int, default=8)
     parser.add_argument("--n-head", type=int, default=8)
     parser.add_argument("--n-embd", type=int, default=384)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--bias", action="store_true", help="Enable linear/layernorm bias terms.")
+    parser.add_argument("--bias", action="store_true",
+                        help="Enable linear/layernorm bias terms.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=4000)
@@ -41,8 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--compile", action="store_true", help="Compile the model with torch.compile.")
-    parser.add_argument("--resume", type=Path, default=None, help="Resume from an existing checkpoint.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Compile the model with torch.compile.")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="Resume from an existing checkpoint.")
     return parser.parse_args()
 
 
@@ -66,7 +73,7 @@ def prepare_dataset(cache_dir: Path) -> dict[str, torch.Tensor]:
         ) from exc
 
     tokenizer = ByteDialogueTokenizer()
-    dataset = load_dataset("daily_dialog")
+    dataset = load_dialogue_dataset(load_dataset)
 
     processed: dict[str, torch.Tensor] = {}
     for split_name in ("train", "validation"):
@@ -78,13 +85,42 @@ def prepare_dataset(cache_dir: Path) -> dict[str, torch.Tensor]:
                 continue
             token_stream.extend(ids)
             mask_stream.extend(mask)
-        processed[f"{split_name}_ids"] = torch.tensor(token_stream, dtype=torch.long)
-        processed[f"{split_name}_mask"] = torch.tensor(mask_stream, dtype=torch.float32)
+        processed[f"{split_name}_ids"] = torch.tensor(
+            token_stream, dtype=torch.long)
+        processed[f"{split_name}_mask"] = torch.tensor(
+            mask_stream, dtype=torch.float32)
 
     processed["dataset_name"] = "daily_dialog"
     processed["tokenizer_vocab_size"] = tokenizer.vocab_size
     torch.save(processed, cache_path)
     return processed
+
+
+def load_dialogue_dataset(load_dataset_fn):
+    dataset_candidates = [
+        "daily_dialog",
+        "OpenRL/daily_dialog",
+    ]
+    last_error: Exception | None = None
+
+    for dataset_name in dataset_candidates:
+        try:
+            print(f"loading dataset: {dataset_name}")
+            return load_dataset_fn(dataset_name)
+        except RuntimeError as exc:
+            last_error = exc
+            if "Dataset scripts are no longer supported" not in str(exc):
+                raise
+            print(f"dataset loader rejected {dataset_name}: {exc}")
+        except Exception as exc:
+            last_error = exc
+            print(f"failed to load {dataset_name}: {exc}")
+
+    raise RuntimeError(
+        "Unable to load a DailyDialog dataset source. "
+        "If you are on datasets 4.x, install `datasets<4` or keep using the "
+        "built-in fallback dataset mirror."
+    ) from last_error
 
 
 def get_batch(
@@ -100,9 +136,9 @@ def get_batch(
         raise RuntimeError("dataset is too small for the selected block size")
 
     starts = torch.randint(0, max_start, (batch_size,)).tolist()
-    x = torch.stack([token_stream[i : i + block_size] for i in starts])
-    y = torch.stack([token_stream[i + 1 : i + block_size + 1] for i in starts])
-    m = torch.stack([mask_stream[i + 1 : i + block_size + 1] for i in starts])
+    x = torch.stack([token_stream[i: i + block_size] for i in starts])
+    y = torch.stack([token_stream[i + 1: i + block_size + 1] for i in starts])
+    m = torch.stack([mask_stream[i + 1: i + block_size + 1] for i in starts])
     return x.to(device), y.to(device), m.to(device)
 
 
@@ -128,7 +164,8 @@ def estimate_loss(
     ):
         losses = []
         for _ in range(eval_iters):
-            x, y, m = get_batch(ids, mask, batch_size=batch_size, block_size=block_size, device=device)
+            x, y, m = get_batch(ids, mask, batch_size=batch_size,
+                                block_size=block_size, device=device)
             with autocast_ctx():
                 _, loss = model(x, y, mask=m)
             losses.append(loss.item())
@@ -165,16 +202,28 @@ def save_checkpoint(
     best_val_loss: float,
     args: argparse.Namespace,
 ) -> None:
+    serialized_args = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "model_config": asdict(config),
         "step": step,
         "best_val_loss": best_val_loss,
-        "train_args": vars(args),
+        "train_args": serialized_args,
         "tokenizer": {"kind": "byte_dialogue_v1"},
     }
     torch.save(checkpoint, checkpoint_path)
+
+
+def load_checkpoint(path: Path, device: str) -> dict:
+    try:
+        return torch.load(path, map_location=device)
+    except pickle.UnpicklingError:
+        with torch.serialization.safe_globals([pathlib.PosixPath, pathlib.WindowsPath]):
+            return torch.load(path, map_location=device)
 
 
 def main() -> None:
@@ -209,7 +258,7 @@ def main() -> None:
     start_step = 0
     best_val_loss = float("inf")
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = load_checkpoint(args.resume, device)
         model.load_state_dict(checkpoint["model"])
         start_step = int(checkpoint["step"]) + 1
         best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
@@ -236,7 +285,7 @@ def main() -> None:
     print(f"vocab size: {config.vocab_size}")
     print(f"parameters: {total_params / 1e6:.2f}M")
     print(
-        "recommended for RTX 5090: "
+        "default training settings: "
         f"--batch-size {args.batch_size} --grad-accum-steps {args.grad_accum_steps} --max-steps {args.max_steps}"
     )
 
@@ -279,7 +328,8 @@ def main() -> None:
         if args.grad_clip > 0:
             if use_scaler:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                raw_model.parameters(), args.grad_clip)
 
         if use_scaler:
             scaler.step(optimizer)

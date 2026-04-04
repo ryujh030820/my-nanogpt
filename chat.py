@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import pickle
+import pathlib
 from pathlib import Path
 
 import torch
@@ -22,7 +24,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_model(checkpoint_path: Path, device: str) -> tuple[GPTLanguageModel, ByteDialogueTokenizer]:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    except pickle.UnpicklingError:
+        with torch.serialization.safe_globals([pathlib.PosixPath, pathlib.WindowsPath]):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
     config = GPTConfig(**checkpoint["model_config"])
     model = GPTLanguageModel(config)
     model.load_state_dict(checkpoint["model"])
