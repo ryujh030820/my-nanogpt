@@ -26,6 +26,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
+        head_dim = config.n_embd // config.n_head
+        assert head_dim % 2 == 0, "head dimension must be even for RoPE"
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
@@ -38,6 +40,32 @@ class CausalSelfAttention(nn.Module):
             torch.ones((config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)))
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = head_dim
+
+        # Precompute RoPE cache up to maximum sequence length.
+        inv_freq = 1.0 / \
+            (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        t = torch.arange(config.block_size, dtype=torch.float)
+        freqs = torch.outer(t, inv_freq)
+        cos = torch.repeat_interleave(freqs.cos(), repeats=2, dim=-1)
+        sin = torch.repeat_interleave(freqs.sin(), repeats=2, dim=-1)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
+    def _rotate_half(self, x):
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        x_rot = torch.stack((-x_odd, x_even), dim=-1)
+        return x_rot.flatten(-2)
+
+    def _apply_rope(self, q, k, T):
+        cos = self.rope_cos[:T, :].to(
+            device=q.device, dtype=q.dtype).unsqueeze(0).unsqueeze(0)
+        sin = self.rope_sin[:T, :].to(
+            device=q.device, dtype=q.dtype).unsqueeze(0).unsqueeze(0)
+        q = (q * cos) + (self._rotate_half(q) * sin)
+        k = (k * cos) + (self._rotate_half(k) * sin)
+        return q, k
 
     def forward(self, x):
         B, T, C = x.size()
@@ -49,6 +77,8 @@ class CausalSelfAttention(nn.Module):
                    self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C //
                    self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        q, k = self._apply_rope(q, k, T)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * k.shape[-1] ** -0.5
@@ -120,7 +150,6 @@ class GPTLanguageModel(nn.Module):
         self.config = config
         self.token_embedding_table = nn.Embedding(
             config.vocab_size, config.n_embd)
-        self.positional_encoding = PositionalEncoding(config)
         self.blocks = nn.Sequential(
             *[Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
@@ -137,7 +166,7 @@ class GPTLanguageModel(nn.Module):
 
     def forward(self, idx, targets=None, mask=None):
         tok_emb = self.token_embedding_table(idx)
-        x = self.positional_encoding(tok_emb)
+        x = tok_emb
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
